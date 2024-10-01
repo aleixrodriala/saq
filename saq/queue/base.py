@@ -18,7 +18,7 @@ from saq.job import (
     Status,
     get_default_job_key,
 )
-from saq.utils import cancel_tasks, now, uuid1
+from saq.utils import now, uuid1
 
 if t.TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Sequence
@@ -68,14 +68,9 @@ class Queue(ABC):
         self._dump = dump or json.dumps
         self._load = load or json.loads
         self._before_enqueues: dict[int, BeforeEnqueueType] = {}
-        self.tasks: set[asyncio.Task[t.Any]] = set()
 
     def job_id(self, job_key: str) -> str:
         return job_key
-
-    @abstractmethod
-    async def disconnect(self) -> None:
-        pass
 
     @abstractmethod
     async def info(self, jobs: bool = False, offset: int = 0, limit: int = 10) -> QueueInfo:
@@ -90,10 +85,6 @@ class Queue(ABC):
 
     @abstractmethod
     async def sweep(self, lock: int = 60, abort: float = 5.0) -> list[str]:
-        pass
-
-    @abstractmethod
-    async def notify(self, job: Job) -> None:
         pass
 
     @abstractmethod
@@ -167,16 +158,14 @@ class Queue(ABC):
 
         return HttpQueue.from_url(url, **kwargs)
 
-    async def upkeep(self) -> None:
-        """Start various upkeep tasks async."""
-
-    async def stop(self) -> None:
-        """Stop the queue and cleanup."""
-        all_tasks = list(self.tasks)
-        self.tasks.clear()
-        await cancel_tasks(all_tasks)
-
     async def connect(self) -> None:
+        pass
+
+    @abstractmethod
+    async def disconnect(self) -> None:
+        pass
+
+    async def poll(self, lock: int = 1) -> None:
         pass
 
     def serialize(self, job: Job) -> bytes | str:
@@ -401,23 +390,17 @@ class Queue(ABC):
 
             return False
 
-        # Start listening before we enqueue the jobs.
-        # This ensures we don't miss any updates.
-        task = asyncio.create_task(self.listen(pending_job_keys, callback, timeout=None))
-
         try:
             await asyncio.gather(*[self.enqueue(job_or_func, **kw) for kw in iter_kwargs])
         except Exception:
             task.cancel()
             raise
 
-        await asyncio.wait_for(task, timeout=timeout)
-
-        jobs: list[Job | None]
-        jobs = await asyncio.gather(*[self.job(job_key) for job_key in job_keys])
+        await self.listen(pending_job_keys, callback, timeout=timeout)
 
         results: list[t.Any] = []
-        for job in jobs:
+
+        for job in await self.jobs(job_keys):
             if job is None:
                 continue
             if job.status in UNSUCCESSFUL_TERMINAL_STATUSES:

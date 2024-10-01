@@ -43,7 +43,6 @@ except ModuleNotFoundError as e:
         "Missing dependencies for Postgres. Install them with `pip install saq[postgres]`."
     ) from e
 
-ENQUEUE_CHANNEL = "saq:enqueue"
 JOBS_TABLE = "saq_jobs"
 STATS_TABLE = "saq_stats"
 
@@ -120,14 +119,6 @@ class PostgresQueue(Queue):
                     SQL(statement).format(jobs_table=self.jobs_table, stats_table=self.stats_table)
                 )
 
-    async def upkeep(self) -> None:
-        await self.init_db()
-
-        self.tasks.add(asyncio.create_task(self.wait_for_job()))
-        self.tasks.add(asyncio.create_task(self.listen_for_enqueues()))
-        if self.poll_interval > 0:
-            self.tasks.add(asyncio.create_task(self.dequeue_timer(self.poll_interval)))
-
     async def connect(self) -> None:
         if self.connection:
             # If connection exists, connect() was already called
@@ -135,6 +126,7 @@ class PostgresQueue(Queue):
 
         await self.pool.open()
         await self.pool.resize(min_size=self.min_size, max_size=self.max_size)
+        await self.init_db()
         # Reserve a connection for dequeue and advisory locks
         self.connection = await self.pool.getconn()
 
@@ -367,32 +359,31 @@ class PostgresQueue(Queue):
         if not job_keys:
             return
 
-        async def _listen(gen: t.AsyncGenerator) -> None:
-            async for notify in gen:
-                payload = json.loads(notify.payload)
-                key = payload["key"]
-                status = Status[payload["status"].upper()]
-                if asyncio.iscoroutinefunction(callback):
-                    stop = await callback(key, status)
-                else:
-                    stop = callback(key, status)
+        keys = list(job_keys)
 
-                if stop:
-                    await gen.aclose()
+        async def listen() -> None:
+            while True:
+                statuses = await self.get_job_statuses(keys)
 
-        async with self.pool.connection() as conn:
-            for key in job_keys:
-                await conn.execute(SQL("LISTEN {}").format(Identifier(key)))
-            await conn.commit()
+                for job_key in keys:
+                    status = statuses.get(job_key)
 
-            if timeout:
-                await asyncio.wait_for(_listen(conn.notifies()), timeout)
-            else:
-                await _listen(conn.notifies())
+                    if not status:
+                        return
 
-    async def notify(self, job: Job, connection: AsyncConnection | None = None) -> None:
-        payload = json.dumps({"key": job.key, "status": job.status})
-        await self._notify(job.key, payload, connection)
+                    if asyncio.iscoroutinefunction(callback):
+                        stop = await callback(job_key, status)
+                    else:
+                        stop = callback(job_key, status)
+
+                    if stop:
+                        return
+                await asyncio.sleep(0.5)
+
+        if timeout:
+            await asyncio.wait_for(listen(), timeout)
+        else:
+            await listen()
 
     async def update(
         self,
@@ -431,7 +422,6 @@ class PostgresQueue(Queue):
                     "expire_at": expire_at,
                 },
             )
-            await self.notify(job, conn)
 
     async def job(self, job_key: str) -> Job | None:
         async with self.pool.connection() as conn, conn.cursor() as cursor:
@@ -448,8 +438,8 @@ class PostgresQueue(Queue):
                 {"key": job_key},
             )
             job = await cursor.fetchone()
-            if job:
-                return self.deserialize(job[0])
+        if job:
+            return self.deserialize(job[0])
         return None
 
     async def jobs(self, job_keys: Iterable[str]) -> t.List[Job | None]:
@@ -476,10 +466,10 @@ class PostgresQueue(Queue):
         statuses: t.List[Status] = list(Status),
         batch_size: int = 100,
     ) -> t.AsyncIterator[Job]:
-        async with self.pool.connection() as conn, conn.cursor() as cursor:
-            last_key = ""
+        last_key = ""
 
-            while True:
+        while True:
+            async with self.pool.connection() as conn, conn.cursor() as cursor:
                 await cursor.execute(
                     SQL(
                         dedent(
@@ -505,46 +495,33 @@ class PostgresQueue(Queue):
 
                 rows = await cursor.fetchall()
 
-                if rows:
-                    for key, job_bytes in rows:
-                        last_key = key
-                        job = self.deserialize(job_bytes)
-                        if job:
-                            yield job
-                else:
-                    break
+            if rows:
+                for key, job_bytes in rows:
+                    last_key = key
+                    job = self.deserialize(job_bytes)
+                    if job:
+                        yield job
+            else:
+                break
 
     async def abort(self, job: Job, error: str, ttl: float = 5) -> None:
         async with self.pool.connection() as conn:
-            status = await self.get_job_status(job.key, for_update=True, connection=conn)
-            if status == Status.QUEUED:
+            status = (await self.get_job_statuses([job.key], for_update=True, connection=conn)).get(
+                job.key
+            )
+            if not status or status == Status.QUEUED:
                 await self.finish(job, Status.ABORTED, error=error, connection=conn)
             else:
                 await self.update(job, status=Status.ABORTING, error=error, connection=conn)
 
     async def dequeue(self, timeout: float = 0) -> Job | None:
-        """Wait on `self.cond` to dequeue.
-
-        Retries indefinitely until a job is available or times out.
-        """
-        self.waiting += 1
-        async with self.cond:
-            self.cond.notify(1)
-
         try:
+            self.waiting += 1
             return await asyncio.wait_for(self.queue.get(), timeout or None)
         except asyncio.exceptions.TimeoutError:
             return None
         finally:
             self.waiting -= 1
-
-    async def wait_for_job(self) -> None:
-        while True:
-            async with self.cond:
-                await self.cond.wait()
-
-            for job in await self._dequeue():
-                await self.queue.put(job)
 
     async def _enqueue(self, job: Job) -> Job | None:
         async with self.pool.connection() as conn, conn.cursor() as cursor:
@@ -574,8 +551,6 @@ class PostgresQueue(Queue):
             if not await cursor.fetchone():
                 return None
 
-            await self._notify(ENQUEUE_CHANNEL, job.key, conn)
-
         logger.info("Enqueuing %s", job.info(logger.isEnabledFor(logging.DEBUG)))
         return job
 
@@ -599,29 +574,12 @@ class PostgresQueue(Queue):
                 },
             )
 
-    async def dequeue_timer(self, poll_interval: int) -> None:
-        """Wakes up a single dequeue task every `poll_interval` seconds."""
-        while True:
-            async with self.cond:
-                self.cond.notify(1)
-            await asyncio.sleep(poll_interval)
-
-    async def listen_for_enqueues(self, timeout: float | None = None) -> None:
-        """Wakes up a single dequeue task when a Postgres enqueue notification is received."""
-        async with self.pool.connection() as conn:
-            await conn.execute(SQL("LISTEN {}").format(Identifier(ENQUEUE_CHANNEL)))
-            await conn.commit()
-            gen = conn.notifies(timeout=timeout)
-            async for _ in gen:
-                async with self.cond:
-                    self.cond.notify(1)
-
-    async def get_job_status(
+    async def get_job_statuses(
         self,
-        key: str,
+        keys: list[str],
         for_update: bool = False,
         connection: AsyncConnection | None = None,
-    ) -> Status:
+    ) -> t.Dict[str, Status]:
         async with self.nullcontext(
             connection
         ) if connection else self.pool.connection() as conn, conn.cursor() as cursor:
@@ -629,9 +587,9 @@ class PostgresQueue(Queue):
                 SQL(
                     dedent(
                         """
-                        SELECT status
+                        SELECT key, status
                         FROM {jobs_table}
-                        WHERE key = %(key)s
+                        WHERE key = ANY(%(keys)s)
                         {for_update}
                         """
                     )
@@ -640,12 +598,10 @@ class PostgresQueue(Queue):
                     for_update=SQL("FOR UPDATE" if for_update else ""),
                 ),
                 {
-                    "key": key,
+                    "keys": keys,
                 },
             )
-            result = await cursor.fetchone()
-            assert result
-            return result[0]
+            return dict(await cursor.fetchall())
 
     async def _retry(self, job: Job, error: str | None) -> None:
         next_retry_delay = job.next_retry_delay()
@@ -685,7 +641,6 @@ class PostgresQueue(Queue):
                     ).format(jobs_table=self.jobs_table),
                     {"key": key},
                 )
-                await self.notify(job, conn)
             await self._release_job(key)
             try:
                 self.queue.task_done()
@@ -693,10 +648,9 @@ class PostgresQueue(Queue):
                 # Error because task_done() called too many times, which happens in unit tests
                 pass
 
-    async def _dequeue(self) -> list[Job]:
-        if not self.waiting:
-            return []
-        jobs = []
+    async def poll(self, lock: int = 1) -> None:
+        if not self.waiting and lock > 0:
+            return
         async with self._get_connection() as conn, conn.cursor() as cursor, conn.transaction():
             await cursor.execute(
                 SQL(
@@ -726,26 +680,15 @@ class PostgresQueue(Queue):
                 {
                     "queue": self.name,
                     "now": math.ceil(seconds(now())),
-                    "limit": self.waiting,
+                    "limit": max(self.waiting, 1),
                 },
             )
             results = await cursor.fetchall()
-            for result in results:
-                job = self.deserialize(result[0])
-                if job:
-                    await self.update(job, status=Status.ACTIVE, connection=conn)
-                    jobs.append(job)
-        return jobs
 
-    async def _notify(
-        self, channel: str, payload: t.Any, connection: AsyncConnection | None = None
-    ) -> None:
-        async with self.nullcontext(connection) if connection else self.pool.connection() as conn:
-            await conn.execute(
-                SQL("NOTIFY {channel}, {payload}").format(
-                    channel=Identifier(channel), payload=payload
-                )
-            )
+        for result in results:
+            job = self.deserialize(result[0])
+            if job:
+                await self.queue.put(job)
 
     @asynccontextmanager
     async def _get_connection(self) -> t.AsyncGenerator:

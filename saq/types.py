@@ -93,6 +93,8 @@ class TimersDict(t.TypedDict):
     "How often to clean up stuck jobs in seconds (default 60)"
     abort: int
     "How often to check if a job is aborted in seconds (default 1)"
+    poll: int
+    "How often to poll for a job if the queue supports polling (default 1)"
 
 
 class PartialTimersDict(TimersDict, total=False):

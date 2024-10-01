@@ -57,10 +57,14 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         assert enqueued is not None
         return enqueued
 
-    async def dequeue(self, **kwargs: t.Any) -> Job:
-        dequeued = await self.queue.dequeue(**kwargs)
+    @staticmethod
+    async def _dequeue(queue):
+        dequeued = await queue.dequeue()
         assert dequeued is not None
         return dequeued
+
+    async def dequeue(self) -> Job:
+        return await self._dequeue(self.queue)
 
     async def count(self, kind: CountKind) -> int:
         return await self.queue.count(kind)
@@ -102,12 +106,6 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.count("queued"), 0)
         self.assertEqual(await self.count("incomplete"), 1)
         self.assertEqual(await self.count("active"), 1)
-
-        task = asyncio.get_running_loop().create_task(self.dequeue())
-        await self.enqueue("test")
-        await asyncio.sleep(0.1)
-        self.assertEqual(await self.count("queued"), 0)
-        await task
 
     async def test_dequeue_fifo(self) -> None:
         await cleanup_queue(self.queue)
@@ -176,9 +174,11 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         # Let's first verify how things work without a retry delay
         worker = Worker(self.queue, functions=functions, dequeue_timeout=0.1)
         job = await self.enqueue("error", retries=2)
+        await self.queue.poll(0)
         await worker.process()
         await job.refresh()
         self.assertEqual(job.status, Status.QUEUED)
+        await self.queue.poll(0)
         await worker.process()
         await job.refresh()
         self.assertEqual(job.status, Status.FAILED)
@@ -220,6 +220,7 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
 
         await self.enqueue("echo", a=1)
         await queue2.enqueue("echo", a=1)
+        await self.queue.poll(0)
         await worker.process()
         await self.queue.stats()
         await queue2.stats()
@@ -258,7 +259,7 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
             counter["x"] += 1
             return counter["x"] == 2
 
-        task = asyncio.create_task(self.queue.listen([job.key], listen, timeout=0.1))
+        task = asyncio.create_task(self.queue.listen([job.key], listen, timeout=3))
         await asyncio.sleep(0)
         await self.queue.update(job)
         await self.queue.update(job)
@@ -452,6 +453,12 @@ class TestPostgresQueue(TestQueue):
         await super().asyncTearDown()
         await teardown_postgres()
 
+    @staticmethod
+    async def _dequeue(queue):
+        queue = queue or cls.queue
+        await queue.poll(0)
+        return await TestQueue._dequeue(queue)
+
     @unittest.skip("Not implemented")
     async def test_job_key(self) -> None:
         pass
@@ -476,7 +483,7 @@ class TestPostgresQueue(TestQueue):
         self.assertEqual(await self.count("incomplete"), 0)
         await job.refresh()
         self.assertEqual(job.status, Status.ABORTED)
-        self.assertEqual(await self.queue.get_job_status(job.key), Status.ABORTED)
+        self.assertEqual(await self.queue.get_job_statuses([job.key]), {job.key: Status.ABORTED})
 
         job = await self.enqueue("test", retries=2)
         await self.dequeue()
@@ -487,7 +494,7 @@ class TestPostgresQueue(TestQueue):
         self.assertEqual(await self.count("queued"), 0)
         self.assertEqual(await self.count("incomplete"), 0)
         self.assertEqual(await self.count("active"), 0)
-        self.assertEqual(await self.queue.get_job_status(job.key), Status.ABORTING)
+        self.assertEqual(await self.queue.get_job_statuses([job.key]), {job.key: Status.ABORTING})
 
     @mock.patch("saq.utils.time")
     async def test_sweep(self, mock_time: MagicMock) -> None:
@@ -540,7 +547,7 @@ class TestPostgresQueue(TestQueue):
 
         another_queue = await self.create_queue()
         for _ in range(2):
-            job = await another_queue.dequeue()
+            job = await self._dequeue(another_queue)
             job.status = Status.ACTIVE
             job.started = 1000
             await another_queue.update(job)

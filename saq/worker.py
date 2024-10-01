@@ -91,6 +91,7 @@ class Worker:
             "stats": 10,
             "sweep": 60,
             "abort": 1,
+            "poll": 1,
         }
         if timers is not None:
             self.timers.update(timers)
@@ -138,6 +139,8 @@ class Worker:
             for signum in self.SIGNALS:
                 loop.add_signal_handler(signum, self.event.set)
 
+            await self.queue.connect()
+
             if self.startup:
                 for s in self.startup:
                     await s(self.context)
@@ -166,7 +169,7 @@ class Worker:
         all_tasks = list(self.tasks)
         self.tasks.clear()
         await cancel_tasks(all_tasks)
-        await self.queue.stop()
+        await self.queue.disconnect()
 
     async def schedule(self, lock: int = 1) -> None:
         for cron_job in self.cron_jobs:
@@ -192,7 +195,7 @@ class Worker:
         async def poll(
             func: Callable[[int], Coroutine], sleep: int, arg: int | None = None
         ) -> None:
-            while not self.event.is_set():
+            while not self.event.is_set() and sleep > 0:
                 try:
                     await func(arg or sleep)
                 except (Exception, asyncio.CancelledError):
@@ -202,11 +205,11 @@ class Worker:
 
                 await asyncio.sleep(sleep)
 
-        await self.queue.upkeep()
         return [
             asyncio.create_task(poll(self.abort, self.timers["abort"])),
             asyncio.create_task(poll(self.schedule, self.timers["schedule"])),
             asyncio.create_task(poll(self.queue.sweep, self.timers["sweep"])),
+            asyncio.create_task(poll(self.queue.poll, self.timers["poll"])),
             asyncio.create_task(
                 poll(self.queue.stats, self.timers["stats"], self.timers["stats"] + 1)
             ),
@@ -351,13 +354,6 @@ def start(
     loop = asyncio.new_event_loop()
     worker = Worker(**settings_obj)
 
-    async def worker_start() -> None:
-        try:
-            await worker.queue.connect()
-            await worker.start()
-        finally:
-            await worker.queue.disconnect()
-
     if web:
         import aiohttp.web
 
@@ -373,10 +369,10 @@ def start(
         app = create_app(queues)
         app.on_shutdown.append(shutdown)
 
-        loop.create_task(worker_start())
+        loop.create_task(worker.start())
         aiohttp.web.run_app(app, port=port, loop=loop)
     else:
-        loop.run_until_complete(worker_start())
+        loop.run_until_complete(worker.start())
 
 
 async def async_check_health(queue: Queue) -> int:
