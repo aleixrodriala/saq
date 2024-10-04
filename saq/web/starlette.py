@@ -25,24 +25,26 @@ ROOT_PATH: str = ""
 
 
 class GZStaticFiles(StaticFiles):
-    async def get_response(
+    def file_response(
         self,
-        path: PathLike,
+        full_path: PathLike,
+        stat_result: os.stat_result,
         scope: Scope,
+        status_code: int = 200,
     ) -> Response:
-        # Check if the client accepts gzip or Brotli encoding
-        headers = Headers(scope=scope)
-        encoding = headers.get('accept-encoding', '')
+        method = scope["method"]
+        request_headers = Headers(scope=scope)
 
-        # Path to the file in the static directory
-        full_path = os.path.join(self.directory, path)
+        response = FileResponse(
+            full_path, status_code=status_code, stat_result=stat_result, method=method
+        )
+        # By default, the starlette StaticFiles handler doesn't handle pre-compressed files, but we explicitly want it to.
+        if str(full_path).endswith(".gz"):
+            response.headers.setdefault("Content-Encoding", "gzip")
+        if self.is_not_modified(response.headers, request_headers):
+            return NotModifiedResponse(response.headers)
+        return response
 
-        if 'gzip' in encoding and os.path.exists(full_path + '.gz'):
-            # Serve Gzip compressed file
-            return FileResponse(full_path + '.gz', headers={'Content-Encoding': 'gzip'})
-
-        # Serve the original file
-        return await super().get_response(path, scope)
 
 async def views(request: Request) -> Response:
     return Response(content=render(root_path=ROOT_PATH), media_type="text/html")
